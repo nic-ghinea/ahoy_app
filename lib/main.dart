@@ -30,6 +30,12 @@ class RobotConfig {
   static double minDrivePower = 0.15; 
   static double turnSensitivity = 1.15;
   
+  // Active Braking (Reverse pulse on joystick release)
+  static bool activeBraking = false;
+  static double brakePower = 0.6; // 10% to 100% reverse power
+  static double brakeDurationMs = 80; // 20ms to 250ms pulse duration
+  static bool brakeScaleWithSpeed = true; // Scale brake power with previous driving speed
+  
   // Weapons
   static double weaponIdle = 600;
   static double weaponActive = 950; 
@@ -61,7 +67,11 @@ class RobotConfig {
       invertRight.toString(),
       swapMotors.toString(),
       invertTurnLeft.toString(),
-      invertTurnRight.toString()
+      invertTurnRight.toString(),
+      activeBraking.toString(),
+      brakePower.toString(),
+      brakeDurationMs.toString(),
+      brakeScaleWithSpeed.toString()
     ]);
     
     if (!availablePresets.contains(name)) { 
@@ -92,6 +102,10 @@ class RobotConfig {
       swapMotors = data.length >= 15 && data[14] == 'true';
       invertTurnLeft = data.length >= 16 && data[15] == 'true';
       invertTurnRight = data.length >= 17 && data[16] == 'true';
+      activeBraking = data.length >= 18 && data[17] == 'true';
+      brakePower = data.length >= 19 ? double.parse(data[18]) : 0.6;
+      brakeDurationMs = data.length >= 20 ? double.parse(data[19]) : 80;
+      brakeScaleWithSpeed = data.length >= 21 ? (data[20] == 'true') : true;
     }
   }
 }
@@ -179,6 +193,15 @@ class _ControllerScreenState extends State<ControllerScreen> {
 
   Timer? _heartbeatTimer;
 
+  // Active Braking State
+  double _lastVl = 0.0;
+  double _lastVr = 0.0;
+  DateTime? _brakeStartTime;
+  double _brakeDirL = 0.0;
+  double _brakeDirR = 0.0;
+  double _activeBrakePowerL = 0.0;
+  double _activeBrakePowerR = 0.0;
+
   // --- LAYOUT EDITING STATE ---
   bool isEditingLayout = false;
   bool _layoutInitialized = false;
@@ -195,8 +218,8 @@ class _ControllerScreenState extends State<ControllerScreen> {
   @override
   void initState() {
     super.initState();
-    // 40ms Polling rate
-    _heartbeatTimer = Timer.periodic(const Duration(milliseconds: 40), (_) {
+    // 20ms Polling rate (50Hz) for low latency and fast active braking response
+    _heartbeatTimer = Timer.periodic(const Duration(milliseconds: 20), (_) {
       if (_isConnected) _calculateAndSend();
     });
   }
@@ -461,6 +484,50 @@ class _ControllerScreenState extends State<ControllerScreen> {
 
     double vL = (driveL + turnL).clamp(-1.0, 1.0);
     double vR = (driveR + turnR).clamp(-1.0, 1.0);
+
+    bool hasUserDriveInput = (vL.abs() > 0.01 || vR.abs() > 0.01);
+
+    if (RobotConfig.activeBraking) {
+      if (hasUserDriveInput) {
+        // User is currently actively driving - cancel any braking pulse and record last movement
+        _brakeStartTime = null;
+        _lastVl = vL;
+        _lastVr = vR;
+      } else {
+        // User released the joysticks (drive demand is 0)
+        final now = DateTime.now();
+        if (_lastVl.abs() > 0.05 || _lastVr.abs() > 0.05) {
+          // Trigger new brake pulse opposite to the last movement direction
+          _brakeStartTime = now;
+          _brakeDirL = -_lastVl.sign;
+          _brakeDirR = -_lastVr.sign;
+          _activeBrakePowerL = RobotConfig.brakeScaleWithSpeed
+              ? (RobotConfig.brakePower * _lastVl.abs()).clamp(0.1, 1.0)
+              : RobotConfig.brakePower;
+          _activeBrakePowerR = RobotConfig.brakeScaleWithSpeed
+              ? (RobotConfig.brakePower * _lastVr.abs()).clamp(0.1, 1.0)
+              : RobotConfig.brakePower;
+          // Clear last velocities so we only trigger this pulse once
+          _lastVl = 0.0;
+          _lastVr = 0.0;
+        }
+
+        // Apply active brake pulse if within duration window
+        if (_brakeStartTime != null) {
+          final elapsed = now.difference(_brakeStartTime!).inMilliseconds;
+          if (elapsed < RobotConfig.brakeDurationMs) {
+            vL = (_brakeDirL * _activeBrakePowerL).clamp(-1.0, 1.0);
+            vR = (_brakeDirR * _activeBrakePowerR).clamp(-1.0, 1.0);
+          } else {
+            _brakeStartTime = null; // Braking pulse complete
+          }
+        }
+      }
+    } else {
+      _brakeStartTime = null;
+      _lastVl = 0.0;
+      _lastVr = 0.0;
+    }
 
     if (RobotConfig.invertLeft) vL = -vL;
     if (RobotConfig.invertRight) vR = -vR;
@@ -948,6 +1015,48 @@ class _SettingsScreenState extends State<SettingsScreen> {
               SwitchListTile(contentPadding: EdgeInsets.zero, title: const Text("Swap N20 Motors", style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold)), subtitle: const Text("Exchange left and right motor outputs", style: TextStyle(fontSize: 13, color: Colors.grey)), activeThumbColor: Colors.deepPurpleAccent, value: RobotConfig.swapMotors, onChanged: (val) => setState(() => RobotConfig.swapMotors = val)),
               _buildSliderOption(title: "Minimum Drive Power", subtitle: "Stall speed prevention limit", value: RobotConfig.minDrivePower, min: 0.0, max: 0.5, divisions: 10, label: "${(RobotConfig.minDrivePower * 100).toInt()}%", onChanged: (val) => setState(() => RobotConfig.minDrivePower = val)),
               _buildSliderOption(title: "Diff. Turn Sensitivity", subtitle: "Multiplier for mixed turning arcs", value: RobotConfig.turnSensitivity, min: 0.5, max: 2.0, divisions: 15, label: RobotConfig.turnSensitivity.toStringAsFixed(2), onChanged: (val) => setState(() => RobotConfig.turnSensitivity = val)),
+              const Divider(height: 40),
+
+              const Text("Category 5: Active Braking", style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold, color: Colors.orangeAccent)),
+              const SizedBox(height: 10),
+              SwitchListTile(
+                contentPadding: EdgeInsets.zero,
+                title: const Text("Active Reverse Braking", style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold)),
+                subtitle: const Text("Pulse motors in reverse upon joystick release for instant stopping", style: TextStyle(fontSize: 13, color: Colors.grey)),
+                activeThumbColor: Colors.deepPurpleAccent,
+                value: RobotConfig.activeBraking,
+                onChanged: (val) => setState(() => RobotConfig.activeBraking = val),
+              ),
+              if (RobotConfig.activeBraking) ...[
+                _buildSliderOption(
+                  title: "Brake Pulse Power",
+                  subtitle: "Reverse motor power applied during the brake pulse",
+                  value: RobotConfig.brakePower,
+                  min: 0.1,
+                  max: 1.0,
+                  divisions: 18,
+                  label: "${(RobotConfig.brakePower * 100).toInt()}%",
+                  onChanged: (val) => setState(() => RobotConfig.brakePower = val),
+                ),
+                _buildSliderOption(
+                  title: "Brake Pulse Duration",
+                  subtitle: "How long the counter-pulse is active (milliseconds)",
+                  value: RobotConfig.brakeDurationMs,
+                  min: 20,
+                  max: 250,
+                  divisions: 23,
+                  label: "${RobotConfig.brakeDurationMs.toInt()} ms",
+                  onChanged: (val) => setState(() => RobotConfig.brakeDurationMs = val),
+                ),
+                SwitchListTile(
+                  contentPadding: EdgeInsets.zero,
+                  title: const Text("Scale Power with Speed", style: TextStyle(color: Colors.white70, fontWeight: FontWeight.bold)),
+                  subtitle: const Text("Apply stronger braking when releasing from top speed, softer when slow", style: TextStyle(fontSize: 13, color: Colors.grey)),
+                  activeThumbColor: Colors.deepPurpleAccent,
+                  value: RobotConfig.brakeScaleWithSpeed,
+                  onChanged: (val) => setState(() => RobotConfig.brakeScaleWithSpeed = val),
+                ),
+              ],
               const Divider(height: 40),
               
               Container(
